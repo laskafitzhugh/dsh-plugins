@@ -3,6 +3,9 @@
  * awake time, and asks the user, inside that session, whether to continue it or archive it.
  *   - Idle means: top-level, no turn running, no child session (agent) running, no background job left (when readLog is given; a log that cannot be read
  *     counts as busy), not blank, not archived, not on hold, no open question or permission card.
+ *   - Idle time runs from the later of the session's last prompt (its row's updatedAt) and the last activity in its log (a turn, message, tool call or
+ *     tool result): a session whose agent worked for hours after the last prompt is not idle the moment that turn ends. Without readLog only the
+ *     last prompt is known.
  *   - Awake time: the time the laptop slept is not counted. A heartbeat (every BEAT_MS) that finds a gap longer than SLEEP_GAP_MS records the gap as sleep.
  *   - The session is prompted (queued) with ASK_PROMPT: it asks with ask_user_question. Continue marked recommended (only when its work is unfinished) is
  *     asked with a timeout, so the existing auto-answer takes the recommended option; no recommended option means no timeout: the question waits forever.
@@ -22,6 +25,10 @@ export const BEAT_MS = 30_000
 export const SLEEP_GAP_MS = 2 * 60_000
 export const MAX_AGE_MS = 3 * 24 * 3600_000
 export const MAX_PER_PASS = 5
+/** Logs read in one pass at most. Sessions that are skipped (busy, unreadable or recently active) also cost a read. */
+export const MAX_READS_PER_PASS = 4 * MAX_PER_PASS
+/** Log records that show the session itself or its user at work, bookkeeping records (titles, commands, projections) do not. */
+const ACTIVITY_TYPE = /^(?:turn|user|assistant|tool)\//
 const RETENTION_MS = 7 * 24 * 3600_000
 const LIST_TIMEOUT_MS = 10_000
 const PROMPT_TIMEOUT_MS = 15_000
@@ -32,6 +39,19 @@ export const ASK_PROMPT = 'This session has been idle for more than an hour. Cal
   + 'If the work is finished or you are waiting for me, recommend nothing and pass no timeout, so the question waits for me. '
   + 'If you call it from inside run_code, give that run_code call timeoutMs 600000, because its default deadline of 2 minutes would kill the question; if the run still times out, ask it once more. '
   + 'If I pick Continue, check git status and the last tool calls and carry on with the task; start nothing new. If I pick Archive, reply with one line that the session is being archived and stop.'
+
+/**
+ * The time of the last activity in a session log.
+ * @param {object[]} records the log records
+ * @returns {number} the latest `time` of a turn, user, assistant or tool record (0 when there is none)
+ */
+export function lastActivityAt(records) {
+  let latest = 0
+  for (const r of Array.isArray(records) ? records : []) {
+    if (typeof r?.type === 'string' && ACTIVITY_TYPE.test(r.type) && Number.isFinite(r.time) && r.time > latest) latest = r.time
+  }
+  return latest
+}
 
 /** Tracks the time the machine slept: beat() is called often; a long gap between two beats is a sleep. */
 export function createSleepTracker({ now = Date.now, gapMs = SLEEP_GAP_MS, io } = {}) {
@@ -65,7 +85,7 @@ const rowTitleOf = (item) => { const v = item?.projections?.values?.title; retur
 const archiveWanted = (item) => (item?.resolution?.answers ?? []).some((a) => [...(Array.isArray(a?.selected) ? a.selected : []), a?.custom].some((s) => typeof s === 'string' && /archive/i.test(s)))
 
 export function createIdleAsker({ controllerOf, registryOf = () => undefined, prGuardOf = () => undefined, store, sleep, heldIds = () => new Set(), now = Date.now, idleMs = ASK_IDLE_MS, maxAgeMs = MAX_AGE_MS,
-  maxPerPass = MAX_PER_PASS, io, log = () => {}, readLog, startedAt = 0, titlesOf }) {
+  maxPerPass = MAX_PER_PASS, maxReadsPerPass = MAX_READS_PER_PASS, io, log = () => {}, readLog, startedAt = 0, titlesOf }) {
   let state = {} // sessionId -> { updatedAt, at, archived? }
   try {
     const d = JSON.parse(io?.read?.() ?? 'null')
@@ -78,15 +98,17 @@ export function createIdleAsker({ controllerOf, registryOf = () => undefined, pr
   const reasonOf = (e) => String(e?.message ?? e).replace(/\s+/g, ' ').slice(0, 200)
   const waiting = (id) => (store?.list?.({ status: 'open' }) ?? []).some((i) => i.sessionId === id && (i.type === 'question' || i.type === 'permission'))
 
-  /** Awake idle time of a session: wall time since its last update minus the machine's sleep. */
-  const awakeIdle = (updatedAt) => now() - updatedAt - (sleep?.sleptBetween(updatedAt, now()) ?? 0)
+  /** Awake idle time of a session: wall time since `since` (its last prompt or last activity) minus the machine's sleep. */
+  const awakeIdle = (since) => now() - since - (sleep?.sleptBetween(since, now()) ?? 0)
 
-  // A background job (run_in_background, not collected or killed since the app started) is work still running: no ask. An unreadable log is treated as busy.
-  async function hasBackgroundJobs(sessionId) {
+  // One read of the session log gives both answers. A background job (run_in_background, not collected or killed since the app started) is work still
+  // running: no ask. An unreadable log is treated as busy. activityAt is when the log last shows the session or its user at work.
+  async function inspectLog(sessionId) {
     try {
       const log1 = await readLog(sessionId)
-      return !log1 || liveBackgroundJobs(log1.records, { startedAt }).length > 0
-    } catch { return true }
+      if (!log1) return { busy: true, activityAt: 0 }
+      return { busy: liveBackgroundJobs(log1.records, { startedAt }).length > 0, activityAt: lastActivityAt(log1.records) }
+    } catch { return { busy: true, activityAt: 0 } }
   }
 
   /** The sessions whose title does not name a pull request. A row without a title of its own is looked up by titlesOf; a failing lookup keeps the session (it is asked). */
@@ -112,10 +134,20 @@ export function createIdleAsker({ controllerOf, registryOf = () => undefined, pr
       .filter((i) => i && typeof i.sessionId === 'string' && isTopLevel(i) && i.running !== true && i.blank !== true && !archived.has(i.sessionId) && !held.has(i.sessionId) && !busyParents.has(i.sessionId)
         && Number.isFinite(i.updatedAt) && t - i.updatedAt <= maxAgeMs && awakeIdle(i.updatedAt) >= idleMs && state[i.sessionId]?.updatedAt !== i.updatedAt && !waiting(i.sessionId))
       .sort((a, b) => b.updatedAt - a.updatedAt)
-    const candidates = (await withoutPrSessions(idle)).slice(0, maxPerPass)
-    const result = { ok: true, asked: [], skipped: [] }
+    const candidates = await withoutPrSessions(idle)
+    const result = { ok: true, asked: [], skipped: [], recent: [] }
+    let reads = 0
     for (const item of candidates) {
-      if (readLog && await hasBackgroundJobs(item.sessionId)) { result.skipped.push(item.sessionId); continue }
+      if (result.asked.length >= maxPerPass || reads >= maxReadsPerPass) break
+      let since = item.updatedAt
+      if (readLog) {
+        reads++
+        const seen = await inspectLog(item.sessionId)
+        if (seen.busy) { result.skipped.push(item.sessionId); continue }
+        // The row's updatedAt is the last prompt only: the agent may have worked long after it.
+        since = Math.max(since, seen.activityAt)
+        if (awakeIdle(since) < idleMs) { result.recent.push(item.sessionId); continue }
+      }
       try {
         await controller.prompt({ requestId: 'idle-ask-' + randomUUID(), sessionId: item.sessionId, mode: 'queue', content: [{ type: 'text', text: ASK_PROMPT }] }, AbortSignal.timeout(PROMPT_TIMEOUT_MS))
       } catch (error) {
@@ -126,7 +158,7 @@ export function createIdleAsker({ controllerOf, registryOf = () => undefined, pr
       state[item.sessionId] = { updatedAt: item.updatedAt, at: now() }
       save()
       result.asked.push(item.sessionId)
-      log('idle-ask: asked ' + item.sessionId + ' (idle ' + Math.round(awakeIdle(item.updatedAt) / 60_000) + ' min awake)')
+      log('idle-ask: asked ' + item.sessionId + ' (idle ' + Math.round(awakeIdle(since) / 60_000) + ' min awake)')
     }
     return result
   }

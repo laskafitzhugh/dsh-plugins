@@ -341,8 +341,8 @@ const defaultModelOf = () => { try { return ctx.get?.('agentDefaultModel') ?? ct
     if (every > 0) { const t = setInterval(() => { void idle.check() }, every); t.unref?.(); idleTimers.push(t) }
   }
 
-  // Idle ask (idle-ask.js): off unless idleAsk: true or env DSH_RQ_IDLE_ASK=1. Every idleAskCheckMs (10 min) a session that is not working and was idle for idleAskMinutes (60) of awake time
-  // (laptop sleep is deducted by a heartbeat) is asked, in that session, whether to continue or archive it; an Archive answer archives it.
+  // Idle ask (idle-ask.js): off unless idleAsk: true or env DSH_RQ_IDLE_ASK=1. Every idleAskCheckMs (10 min) a session that is not working and was idle for idleAskMinutes (60) of awake time since its last prompt or
+  // last logged activity (laptop sleep is deducted by a heartbeat) is asked, in that session, whether to continue or archive it; an Archive answer archives it.
   const askWanted = config.idleAsk === true || (config.idleAsk !== false && process.env.DSH_RQ_IDLE_ASK === '1')
   const askTimers = []
   if (askWanted) {

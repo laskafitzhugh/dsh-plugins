@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createStore } from '../store.js'
-import { createIdleAsker, createSleepTracker, ASK_PROMPT, isPrTitle } from '../idle-ask.js'
+import { createIdleAsker, createSleepTracker, ASK_PROMPT, isPrTitle, lastActivityAt } from '../idle-ask.js'
 
 const H = 3600_000
 const memIo = () => { const io = { text: undefined, read: () => io.text, write: (t) => { io.text = t } }; return io }
@@ -25,6 +25,72 @@ test('asks a session idle for over an hour, once per idle state', async () => {
   assert.equal(r.prompts[0].mode, 'queue')
   assert.equal(r.prompts[0].content[0].text, ASK_PROMPT)
   assert.deepEqual((await r.asker.check()).asked, [])
+})
+
+const MIN = 60_000
+const logOf = (...records) => ({ records })
+
+test('lastActivityAt: the latest turn, user, assistant or tool record; bookkeeping records and records without a time do not count', () => {
+  assert.equal(lastActivityAt([]), 0)
+  assert.equal(lastActivityAt(undefined), 0)
+  assert.equal(lastActivityAt([
+    { type: 'user/message', time: 10 }, { type: 'assistant/message', time: 30 }, { type: 'tool/result', time: 20 }, { type: 'turn/end', time: 40 },
+    { type: 'tool/ptc-dispatch', time: 35 }, { type: 'session/title', time: 90 }, { type: 'command/done', time: 95 }, { type: 'turn/end' }, { type: 'turn/end', time: 'late' }, null,
+  ]), 40)
+})
+
+test('a session whose agent worked long after the last prompt is asked only once it is idle from that activity', async () => {
+  // Last prompt 9 hours ago; the turn that followed ended 5 minutes ago.
+  const logs = { a: [{ type: 'user/message', time: 1 * H }, { type: 'turn/end', time: 10 * H - 5 * MIN }] }
+  const r = rig([S('a', 1 * H)], { readLog: async (id) => logOf(...logs[id]) })
+  const first = await r.asker.check()
+  assert.deepEqual(first.asked, [])
+  assert.deepEqual(first.recent, ['a'])
+  assert.equal(r.prompts.length, 0)
+  r.setNow(10 * H + 54 * MIN) // 59 minutes after the turn ended
+  assert.deepEqual((await r.asker.check()).asked, [])
+  r.setNow(10 * H + 56 * MIN) // 61 minutes after
+  assert.deepEqual((await r.asker.check()).asked, ['a'])
+  assert.deepEqual((await r.asker.check()).asked, [], 'once per idle state')
+})
+
+test('laptop sleep after the last activity is not idle time either', async () => {
+  let t = 10 * H
+  const sleep = createSleepTracker({ now: () => t })
+  const activity = 10 * H - 90 * MIN
+  t = activity + 10 * MIN; sleep.beat()
+  t = activity + 70 * MIN; sleep.beat() // a 60 minute gap: slept
+  const r = rig([S('a', 1 * H)], { sleep, readLog: async () => logOf({ type: 'turn/end', time: activity }) })
+  r.setNow(10 * H)
+  assert.deepEqual((await r.asker.check()).asked, []) // 30 min awake only
+  r.setNow(10 * H + 31 * MIN)
+  assert.deepEqual((await r.asker.check()).asked, ['a'])
+})
+
+test('records that are not activity do not postpone the ask', async () => {
+  const r = rig([S('a', 1 * H)], { readLog: async () => logOf({ type: 'session/title', time: 10 * H - MIN }, { type: 'command/done', time: 10 * H - MIN }) })
+  assert.deepEqual((await r.asker.check()).asked, ['a'])
+})
+
+test('recently active sessions do not use up the per-pass limit of the idle ones', async () => {
+  const items = []
+  const logs = {}
+  for (let i = 0; i < 6; i++) { items.push(S('busy' + i, 1 * H + i)); logs['busy' + i] = [{ type: 'turn/end', time: 10 * H - MIN }] }
+  items.push(S('idle', 1 * H)); logs.idle = [{ type: 'turn/end', time: 2 * H }]
+  const r = rig(items, { readLog: async (id) => logOf(...logs[id]) })
+  const res = await r.asker.check()
+  assert.deepEqual(res.asked, ['idle'])
+  assert.equal(res.recent.length, 6)
+})
+
+test('a pass reads at most maxReadsPerPass logs and asks at most maxPerPass sessions', async () => {
+  const items = Array.from({ length: 10 }, (_, i) => S('s' + i, 1 * H + i))
+  let reads = 0
+  const r = rig(items, { maxReadsPerPass: 4, readLog: async () => { reads++; return logOf() } })
+  assert.equal((await r.asker.check()).asked.length, 4)
+  assert.equal(reads, 4)
+  const r2 = rig(items, { maxPerPass: 2, readLog: async () => logOf() })
+  assert.equal((await r2.asker.check()).asked.length, 2)
 })
 
 test('never asks a working session, one with a running child, a blank, an archived or a held one', async () => {
