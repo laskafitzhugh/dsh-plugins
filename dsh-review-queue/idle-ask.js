@@ -25,7 +25,7 @@ export const BEAT_MS = 30_000
 export const SLEEP_GAP_MS = 2 * 60_000
 export const MAX_AGE_MS = 3 * 24 * 3600_000
 export const MAX_PER_PASS = 5
-/** Logs read in one pass at most. Sessions that are skipped (busy, unreadable or recently active) also cost a read. */
+/** Logs read in one pass at most. A session skipped as busy or unreadable also costs a read, one whose log was written recently does not (a stat settles it). */
 export const MAX_READS_PER_PASS = 4 * MAX_PER_PASS
 /** Log records that show the session itself or its user at work, bookkeeping records (titles, commands, projections) do not. */
 const ACTIVITY_TYPE = /^(?:turn|user|assistant|tool)\//
@@ -85,7 +85,7 @@ const rowTitleOf = (item) => { const v = item?.projections?.values?.title; retur
 const archiveWanted = (item) => (item?.resolution?.answers ?? []).some((a) => [...(Array.isArray(a?.selected) ? a.selected : []), a?.custom].some((s) => typeof s === 'string' && /archive/i.test(s)))
 
 export function createIdleAsker({ controllerOf, registryOf = () => undefined, prGuardOf = () => undefined, store, sleep, heldIds = () => new Set(), now = Date.now, idleMs = ASK_IDLE_MS, maxAgeMs = MAX_AGE_MS,
-  maxPerPass = MAX_PER_PASS, maxReadsPerPass = MAX_READS_PER_PASS, io, log = () => {}, readLog, startedAt = 0, titlesOf }) {
+  maxPerPass = MAX_PER_PASS, maxReadsPerPass = MAX_READS_PER_PASS, io, log = () => {}, readLog, lastWriteOf, startedAt = 0, titlesOf }) {
   let state = {} // sessionId -> { updatedAt, at, archived? }
   try {
     const d = JSON.parse(io?.read?.() ?? 'null')
@@ -102,13 +102,21 @@ export function createIdleAsker({ controllerOf, registryOf = () => undefined, pr
   const awakeIdle = (since) => now() - since - (sleep?.sleptBetween(since, now()) ?? 0)
 
   // One read of the session log gives both answers. A background job (run_in_background, not collected or killed since the app started) is work still
-  // running: no ask. An unreadable log is treated as busy. activityAt is when the log last shows the session or its user at work.
+  // running: no ask. A log that cannot be read is treated as busy and says why. activityAt is when the log last shows the session or its user at work.
   async function inspectLog(sessionId) {
     try {
       const log1 = await readLog(sessionId)
-      if (!log1) return { busy: true, activityAt: 0 }
+      if (!log1) return { busy: true, activityAt: 0, unreadable: 'missing, unreadable or over the size limit' }
       return { busy: liveBackgroundJobs(log1.records, { startedAt }).length > 0, activityAt: lastActivityAt(log1.records) }
-    } catch { return { busy: true, activityAt: 0 } }
+    } catch (error) { return { busy: true, activityAt: 0, unreadable: reasonOf(error) } }
+  }
+
+  // An unreadable log keeps its session from ever being asked: say so once per session instead of on every pass.
+  const reportedUnreadable = new Set()
+  function reportUnreadable(sessionId, why) {
+    if (reportedUnreadable.has(sessionId)) return
+    reportedUnreadable.add(sessionId)
+    log('idle-ask: not asking ' + sessionId + ': its log cannot be read (' + why + ')')
   }
 
   /** The sessions whose title does not name a pull request. A row without a title of its own is looked up by titlesOf; a failing lookup keeps the session (it is asked). */
@@ -138,13 +146,17 @@ export function createIdleAsker({ controllerOf, registryOf = () => undefined, pr
     const result = { ok: true, asked: [], skipped: [], recent: [] }
     let reads = 0
     for (const item of candidates) {
-      if (result.asked.length >= maxPerPass || reads >= maxReadsPerPass) break
+      if (result.asked.length >= maxPerPass) break
+      // A log written within the idle time cannot belong to an idle session. A stat settles that without reading it, and costs no read.
+      const written = lastWriteOf ? await lastWriteOf(item.sessionId) : undefined
+      if (written !== undefined && awakeIdle(Math.max(item.updatedAt, written)) < idleMs) { result.recent.push(item.sessionId); continue }
       let since = item.updatedAt
       if (readLog) {
+        if (reads >= maxReadsPerPass) break
         reads++
         const seen = await inspectLog(item.sessionId)
+        if (seen.unreadable) reportUnreadable(item.sessionId, seen.unreadable)
         if (seen.busy) { result.skipped.push(item.sessionId); continue }
-        // The row's updatedAt is the last prompt only: the agent may have worked long after it.
         since = Math.max(since, seen.activityAt)
         if (awakeIdle(since) < idleMs) { result.recent.push(item.sessionId); continue }
       }
@@ -160,6 +172,7 @@ export function createIdleAsker({ controllerOf, registryOf = () => undefined, pr
       result.asked.push(item.sessionId)
       log('idle-ask: asked ' + item.sessionId + ' (idle ' + Math.round(awakeIdle(since) / 60_000) + ' min awake)')
     }
+    if (result.recent.length) log('idle-ask: ' + result.recent.length + ' session(s) not asked yet: active since their last prompt')
     return result
   }
 
@@ -185,7 +198,7 @@ export function createIdleAsker({ controllerOf, registryOf = () => undefined, pr
 
   let running
   return {
-    /** One pass: { ok: true, asked: [sessionId] } | { ok: false, error }. Passes never overlap. */
+    /** One pass: { ok: true, asked, skipped (busy or unreadable log), recent (active since their last prompt) } with session ids | { ok: false, error }. Passes never overlap. */
     check() {
       running ??= run().then(async (r) => { await archiveAnswered(); return r }).catch((error) => { log('idle-ask: check failed: ' + reasonOf(error)); return { ok: false, error: 'check-failed' } }).finally(() => { running = undefined })
       return running

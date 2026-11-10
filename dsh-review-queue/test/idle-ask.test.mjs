@@ -93,6 +93,55 @@ test('a pass reads at most maxReadsPerPass logs and asks at most maxPerPass sess
   assert.equal((await r2.asker.check()).asked.length, 2)
 })
 
+test('a session whose log was written within the idle time is skipped by a stat, without reading its log, and the pass says so', async () => {
+  let reads = 0
+  const logs = []
+  const written = { a: 10 * H - 5 * MIN }
+  const r = rig([S('a', 1 * H)], { log: (l) => logs.push(l), lastWriteOf: async (id) => written[id], readLog: async () => { reads++; return logOf() } })
+  const first = await r.asker.check()
+  assert.deepEqual(first.asked, [])
+  assert.deepEqual(first.recent, ['a'])
+  assert.equal(reads, 0)
+  assert.ok(logs.some((l) => /1 session\(s\) not asked yet/.test(l)), logs.join(' | '))
+  r.setNow(10 * H + 56 * MIN)
+  assert.deepEqual((await r.asker.check()).asked, ['a'])
+  assert.equal(reads, 1)
+})
+
+test('sessions skipped by a stat do not use up the read budget of the idle ones', async () => {
+  const items = []
+  const written = { idle: 2 * H }
+  for (let i = 0; i < 25; i++) { items.push(S('recent' + i, 2 * H + i)); written['recent' + i] = 10 * H - MIN }
+  items.push(S('idle', 1 * H))
+  let reads = 0
+  const r = rig(items, { maxReadsPerPass: 2, lastWriteOf: async (id) => written[id], readLog: async () => { reads++; return logOf() } })
+  const res = await r.asker.check()
+  assert.deepEqual(res.asked, ['idle'])
+  assert.equal(res.recent.length, 25)
+  assert.equal(reads, 1)
+})
+
+test('a session without a write time is judged from its log', async () => {
+  const r = rig([S('a', 1 * H)], { lastWriteOf: async () => undefined, readLog: async () => logOf({ type: 'turn/end', time: 10 * H - MIN }) })
+  const res = await r.asker.check()
+  assert.deepEqual(res.asked, [])
+  assert.deepEqual(res.recent, ['a'])
+})
+
+test('a log that cannot be read keeps its session from being asked and is logged once per session; a background job is not logged', async () => {
+  const logs = []
+  const started = { type: 'tool/result', time: 5, data: { content: 'started background job job-1' } }
+  const r = rig([S('gone', 1 * H), S('boom', 1 * H), S('job', 1 * H)], {
+    log: (l) => logs.push(l),
+    readLog: async (id) => { if (id === 'boom') throw new Error('disk on fire'); return id === 'job' ? logOf(started) : undefined },
+  })
+  assert.deepEqual((await r.asker.check()).skipped.sort(), ['boom', 'gone', 'job'])
+  await r.asker.check()
+  assert.equal(logs.filter((l) => /not asking gone: .*missing, unreadable or over the size limit/.test(l)).length, 1)
+  assert.equal(logs.filter((l) => /not asking boom: .*disk on fire/.test(l)).length, 1)
+  assert.equal(logs.filter((l) => /not asking job/.test(l)).length, 0)
+})
+
 test('never asks a working session, one with a running child, a blank, an archived or a held one', async () => {
   const old = 1 * H
   const r = rig([S('run', old, { running: true }), S('parent', old), S('child', old + 1, { running: true, parentSessionId: 'parent' }), S('blank', old, { blank: true }), S('arch', old), S('held', old)], {

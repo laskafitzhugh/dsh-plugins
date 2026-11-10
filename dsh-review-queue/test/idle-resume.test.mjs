@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { zstdCompressSync } from 'node:zlib'
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fakeLlm, systemOf, userOf } from './todo-tune-helpers.mjs'
@@ -333,4 +333,19 @@ test('createLogReader reads the records of a session log under the sessions fold
   assert.equal(await read(ID(2)), undefined)
   assert.equal(await createLogReader({ root, maxBytes: 5 })(ID(1)), undefined)
   assert.equal(await read('../etc'), undefined)
+})
+
+test('createLogStatter gives the last write time of a session log without reading it, and nothing for a missing, an unknown or an unstattable one', async (t) => {
+  const { createLogStatter } = await load()
+  const root = mkdtempSync(join(tmpdir(), 'rq-idle-'))
+  t.after(() => rmSync(root, { recursive: true, force: true }))
+  const dir = join(root, '--D--dev--p--', ID(1))
+  mkdirSync(dir, { recursive: true })
+  const file = join(dir, 'session.v4.jsonl.zstd')
+  writeFileSync(file, 'not a log, never read')
+  const lastWriteOf = createLogStatter({ root })
+  assert.equal(await lastWriteOf(ID(1)), Math.round(statSync(file).mtimeMs))
+  assert.equal(await lastWriteOf(ID(2)), undefined)
+  assert.equal(await lastWriteOf('../etc'), undefined)
+  assert.equal(await createLogStatter({ root, io: { stat: async () => { throw new Error('denied') } } })(ID(1)), undefined)
 })

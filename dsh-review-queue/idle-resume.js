@@ -102,6 +102,17 @@ export function createLogReader({ root, maxBytes = MAX_LOG_BYTES, io = {} } = {}
   }
 }
 
+/** lastWriteOf(sessionId) -> the time (ms) of the last write to the session log, or undefined when there is none: a stat, the log is not read. */
+export function createLogStatter({ root, io = {} } = {}) {
+  const fs = { stat, ...io }
+  return async (sessionId) => {
+    try {
+      const file = await findSessionLog(root, sessionId)
+      return file ? Math.round((await fs.stat(file)).mtimeMs) : undefined
+    } catch { return undefined }
+  }
+}
+
 /** The last user request and the last assistant reply of a log, longer than classifyLog keeps them (the model needs the end of the reply). */
 function lastTexts(records) {
   let lastUser = ''

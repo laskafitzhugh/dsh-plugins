@@ -66,7 +66,7 @@ import { sourcesForItem } from './triage-sources.js'
 import { snippetsFromThread } from './follow-up.js'
 import { createTaskbarBadge } from './taskbar.js'
 import { createSurveyLogReader } from './tip-survey.js'
-import { CHECK_MS, IDLE_MS, createIdleJudge, createIdleResumer, createLogReader } from './idle-resume.js'
+import { CHECK_MS, IDLE_MS, createIdleJudge, createIdleResumer, createLogReader, createLogStatter } from './idle-resume.js'
 import { ASK_CHECK_MS, ASK_IDLE_MS, BEAT_MS, createIdleAsker, createSleepTracker } from './idle-ask.js'
 import { createTriageJudge } from './triage-judge.js'
 import { createTriageLog } from './triage-log.js'
@@ -341,8 +341,8 @@ const defaultModelOf = () => { try { return ctx.get?.('agentDefaultModel') ?? ct
     if (every > 0) { const t = setInterval(() => { void idle.check() }, every); t.unref?.(); idleTimers.push(t) }
   }
 
-  // Idle ask (idle-ask.js): off unless idleAsk: true or env DSH_RQ_IDLE_ASK=1. Every idleAskCheckMs (10 min) a session that is not working and was idle for idleAskMinutes (60) of awake time since its last prompt or
-  // last logged activity (laptop sleep is deducted by a heartbeat) is asked, in that session, whether to continue or archive it; an Archive answer archives it.
+  // Idle ask (idle-ask.js): off unless idleAsk: true or env DSH_RQ_IDLE_ASK=1. Every idleAskCheckMs (10 min) a session that is not working and was idle for idleAskMinutes (60)
+  // of awake time since its last prompt or logged activity (laptop sleep is deducted by a heartbeat) is asked, in that session, whether to continue or archive it; an Archive answer archives it.
   const askWanted = config.idleAsk === true || (config.idleAsk !== false && process.env.DSH_RQ_IDLE_ASK === '1')
   const askTimers = []
   if (askWanted) {
@@ -350,6 +350,7 @@ const defaultModelOf = () => { try { return ctx.get?.('agentDefaultModel') ?? ct
     const asker = createIdleAsker({
       controllerOf, registryOf, prGuardOf, store, sleep, heldIds, log, startedAt, titlesOf,
       readLog: config.idleDeps?.readLog ?? createLogReader({ root: sessionsRoot }),
+      lastWriteOf: config.idleDeps?.lastWriteOf ?? createLogStatter({ root: sessionsRoot }),
       idleMs: Number.isFinite(config.idleAskMinutes) && config.idleAskMinutes > 0 ? config.idleAskMinutes * 60_000 : ASK_IDLE_MS,
       io: stateDir ? fileIo(join(stateDir, 'idle-ask.json')) : undefined,
     })
